@@ -1,0 +1,390 @@
+variables:
+  MajorVersion: 1
+  MinorVersion: 0
+  PatchNumber: 0  
+  NonProdServiceConnection: 'change-me' 
+  ProdServiceConnection: 'change-me'
+  FunctionName: 'change-me'
+  FunctionRG: 'change-me'
+  ProjectName: 'Cchange-me'
+  ParameterFileName: 'change-me'
+  SonarServiceConnection: 'change-me'
+  SonarProjectKey: 'change-me'
+  SonarProjectName: 'change-me'
+  ApiParameterFileName: 'change-mes'
+  NonProdApimRG: 'RG-CTG-APIM-DEV'
+  ProdApimRG: 'RG-CTG-APIM-PROD'
+
+trigger:
+  branches:
+    include:
+      - main
+
+     
+  paths:
+    exclude:
+      - ops/** 
+      - ops/pipelines/**
+      - ops/templates/**
+ 
+# Build Format defined as Major.Minor.Patch.Revision
+name: $(MajorVersion).$(MinorVersion).$(PatchNumber).$(Rev:r)
+
+stages:
+    - stage: Build
+      jobs:
+          - job: BuildAndTest
+            pool:
+              name: ctg-az-win
+
+            steps:
+                - task: VisualStudioTestPlatformInstaller@1
+                  displayName: Install Visual Studio TestPlatform
+                  inputs:
+                    versionSelector: latestStable
+
+
+                - task: UseDotNet@2
+                  displayName: "use dotnet version"
+                  inputs:
+                    version: 6.0.x
+
+
+                - task: SonarCloudPrepare@1
+                  displayName: 'Prepare analysis configuration'
+                  inputs:
+                    SonarCloud: '$(SonarServiceConnection)' #service connection name
+                    organization: 'christies'
+                    scannerMode: 'MSBuild'
+                    projectKey: '$(SonarProjectKey)'
+                    projectName: $(SonarProjectName)'
+                    # depending of your project you may need extra properties for test results, (usually for .net MVC apps)
+                    extraProperties: |
+                      sonar.cs.opencover.reportsPaths=$(System.DefaultWorkingDirectory)/**/coverage.opencover.xml
+                      sonar.coverage.exclusions=**/*Program.cs
+
+                                
+                - task: DotNetCoreCLI@2
+                  displayName: "Build Function App Code"
+                  inputs:
+                    projects: '**/**.csproj
+                    command: 'build'
+                    arguments: '--output $(Build.BinariesDirectory)/build_output --configuration Release  /p:Version=$(MajorVersion).$(MinorVersion).$(PatchNumber) /p:FileVersion=$(Build.BuildNumber)'
+
+                - task: DotNetCoreCLI@2
+                  displayName: "Running Unit Tests"
+                  inputs:
+                    projects: '$(System.DefaultWorkingDirectory)/**/*.Tests.csproj'
+                    command: 'test'
+                    arguments: /p:CoverletOutput=TestResults/CodeCoverage/ /p:CollectCoverage=true "/p:CoverletOutputFormat=\"cobertura,opencover\"" /p:ExcludeByFile="**/Startup*.cs"  
+                
+                - script: |
+                    dotnet tool install -g dotnet-reportgenerator-globaltool
+                    reportgenerator -reports:$(System.DefaultWorkingDirectory)/**/coverage.cobertura.xml -targetdir:$(Build.SourcesDirectory)/CodeCoverage -reporttypes:HtmlInline_AzurePipelines;Cobertura
+                  displayName: CreateCodeCoverageReport    
+
+                - task: PublishCodeCoverageResults@1
+                  displayName: PublishCodeCoverageResults
+                  inputs:
+                    codeCoverageTool: Cobertura
+                    summaryFileLocation: '$(Build.SourcesDirectory)/CodeCoverage/*cobertura.xml'
+                    reportDirectory: '$(Build.SourcesDirectory)/CodeCoverage' 
+
+                - task: SonarCloudAnalyze@1
+                  displayName: 'Run SonarCloud analysis'
+
+                - task: SonarCloudPublish@1
+                  displayName: 'Publish results on build summary'
+                  
+                - task: DotNetCoreCLI@2
+                  displayName: "Running Integration Tests"
+                  inputs:
+                    projects: '$(System.DefaultWorkingDirectory)/**/*.IntegrationTests.csproj'
+                    command: 'test'
+
+                - task: ArchiveFiles@2
+                  displayName: "Package"
+                  inputs:
+                    rootFolderOrFile: '$(Build.BinariesDirectory)/build_output'
+                    includeRootFolder: false
+                    archiveType: 'zip'
+                    archiveFile: '$(Build.ArtifactStagingDirectory)/$(Build.BuildNumber).zip'
+                    replaceExistingArchive: true
+                    verbose: true
+            
+                - task: PublishBuildArtifacts@1
+                  displayName: 'Publish Build Artifact: '
+                  inputs:
+                       PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(Build.BuildNumber).zip'
+                       ArtifactName: 'service' 
+
+                - task: CopyFiles@2
+                  displayName: Copy ops infrastructure templates
+                  inputs:
+                      SourceFolder: 'ops'
+                      Contents: '**'
+                      TargetFolder: '$(Build.ArtifactStagingDirectory)/ops'
+                
+                - task: PublishBuildArtifacts@1
+                  inputs:
+                      PathtoPublish: '$(Build.ArtifactStagingDirectory)/ops'
+                      ArtifactName: 'ops'                      
+                  displayName: Publish Ops templates 
+    
+
+    - stage: DeployToDev
+      jobs:
+          - job: DeployFunctionApp
+            pool:
+              name: ctg-az-linux
+
+            variables:
+              env: 'dev'
+              ${{ if eq(variables['env'], 'PROD') }}:
+                subscription: 'CTG-Production'
+              ${{ else }}: 
+                subscription: 'CTG Development'      
+
+            steps:
+            - task: DownloadBuildArtifacts@0
+              displayName: 'Download function app code artifact'
+              inputs:
+                buildType: 'current'
+                artifactName: 'service'
+                downloadPath: '$(System.ArtifactsDirectory)'  
+
+            - task: DownloadBuildArtifacts@0
+              displayName: 'Download function app ops artifact'
+              inputs:
+                buildType: 'current'
+                artifactName: 'ops'
+                downloadPath: '$(System.ArtifactsDirectory)'
+
+            - task: AzureCLI@2
+              displayName: 'Deploy ${{variables.ProjectName}} Infra'
+              inputs:
+                azureSubscription: '${{variables.NonProdServiceConnection}}'
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+                  echo '$(subscription)'
+                  az account set --subscription '$(subscription)'
+                  az deployment group create --resource-group  $(FunctionRG)-$(env) --name '$(ProjectName)-$(env)-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/main.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/$(ParameterFileName)-$(env).json'
+      
+
+            - template: DeployFunctionApp.yml
+              parameters:
+                  functionAppName: '$(FunctionName)-$(env)'
+                  azureServiceConnection: '$(NonProdServiceConnection)'
+                  functionAppServiceFilePath: '/service/*.zip'
+                  env: '$(env)'
+                  resourceGroupName: '$(FunctionRG)-$(env)'                                      
+
+            - task: AzureCLI@2
+              displayName: 'Deploy ${{variables.ProjectName}} API Definition'
+              inputs:
+                azureSubscription: '${{variables.NonProdServiceConnection}}'
+                scriptType: pscore
+                scriptLocation: inlineScript
+                inlineScript: |
+                  echo '$(subscription)'
+                  az account set --subscription '$(subscription)'
+                  az deployment group create --resource-group  $(NonProdApimRG) --name '$(ProjectName)-api-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/apim/main-api.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/apim/$(ApiParameterFileName)-$(env).json'
+      
+                                     
+    - stage: DeployToSIT
+      dependsOn:
+              - DeployToDev
+      condition: and(succeeded('DeployToDev'), ne(variables['Build.Reason'], 'PullRequest'))
+      jobs:
+      - deployment: DeployFunctionApp
+        pool:
+          name: ctg-az-linux
+
+        variables:
+              env: 'sit'
+              ${{ if eq(variables['env'], 'PROD') }}:
+                subscription: 'CTG-Production'
+              ${{ else }}: 
+                subscription: 'CTG Development' 
+
+        environment: NAME-SIT
+        strategy:
+            runOnce:
+              deploy:
+                steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download function app code artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'service'
+                    downloadPath: '$(System.ArtifactsDirectory)'   
+
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download function app ops artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'ops'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy ${{variables.ProjectName}} Infra'
+                  inputs:
+                    azureSubscription: '${{variables.NonProdServiceConnection}}'
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo '$(subscription)'
+                      az account set --subscription '$(subscription)'
+                      az deployment group create --resource-group  $(FunctionRG)-$(env) --name '$(ProjectName)-$(env)-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/main.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/$(ParameterFileName)-$(env).json'
+          
+
+                - template: DeployFunctionApp.yml
+                  parameters:
+                      functionAppName: '$(FunctionName)-$(env)'
+                      azureServiceConnection: '$(NonProdServiceConnection)'
+                      functionAppServiceFilePath: '/service/*.zip'
+                      env: '$(env)'
+                      resourceGroupName: '$(FunctionRG)-$(env)'   
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy ${{variables.ProjectName}} API Definition'
+                  inputs:
+                    azureSubscription: '${{variables.NonProdServiceConnection}}'
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo '$(subscription)'
+                      az account set --subscription '$(subscription)'
+                      az deployment group create --resource-group  $(NonProdApimRG) --name '$(ProjectName)-api-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/apim/main-api.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/apim/$(ApiParameterFileName)-$(env).json'
+          
+                                                          
+    - stage: DeployToUAT
+      dependsOn:
+                - DeployToSIT
+      condition: and(succeeded('DeployToSIT'), ne(variables['Build.Reason'], 'PullRequest'))
+      jobs:
+      - deployment: DeployFunctionApp
+        pool:
+          name: ctg-az-linux
+        variables:
+              env: 'uat'
+              ${{ if eq(variables['env'], 'PROD') }}:
+                subscription: 'CTG-Production'
+              ${{ else }}: 
+                subscription: 'CTG Development' 
+        environment: NAME-UAT
+        strategy:
+            runOnce:
+              deploy:
+                steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download function app code artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'service'
+                    downloadPath: '$(System.ArtifactsDirectory)'   
+
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download function app ops artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'ops'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy ${{variables.ProjectName}} Infra'
+                  inputs:
+                    azureSubscription: '${{variables.NonProdServiceConnection}}'
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo '$(subscription)'
+                      az account set --subscription '$(subscription)'
+                      az deployment group create --resource-group  $(FunctionRG)-$(env) --name '$(ProjectName)-$(env)-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/main.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/$(ParameterFileName)-$(env).json'
+          
+
+                - template: DeployFunctionApp.yml
+                  parameters:
+                      functionAppName: '$(FunctionName)-$(env)'
+                      azureServiceConnection: '$(NonProdServiceConnection)'
+                      functionAppServiceFilePath: '/service/*.zip'
+                      env: '$(env)'
+                      resourceGroupName: '$(FunctionRG)-$(env)' 
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy ${{variables.ProjectName}} API Definition'
+                  inputs:
+                    azureSubscription: '${{variables.NonProdServiceConnection}}'
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo '$(subscription)'
+                      az account set --subscription '$(subscription)'
+                      az deployment group create --resource-group  $(NonProdApimRG) --name '$(ProjectName)-api-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/apim/main-api.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/apim/$(ApiParameterFileName)-$(env).json'
+          
+
+    - stage: DeployToPROD
+      dependsOn:
+                - DeployToUAT
+      condition: and(succeeded('DeployToUAT'), ne(variables['Build.Reason'], 'PullRequest'))
+      jobs:
+      - deployment: DeployFunctionApp
+        pool:
+          name: ctg-az-linux
+        variables:
+              env: 'prod'
+              ${{ if eq(variables['env'], 'PROD') }}:
+                subscription: 'CTG-Production'
+              ${{ else }}: 
+                subscription: 'CTG Development' 
+        environment: NAME-PROD
+        strategy:
+            runOnce:
+              deploy:
+                steps:
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download function app code artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'service'
+                    downloadPath: '$(System.ArtifactsDirectory)'   
+
+                - task: DownloadBuildArtifacts@0
+                  displayName: 'Download function app ops artifact'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'ops'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy ${{variables.ProjectName}} Infra'
+                  inputs:
+                    azureSubscription: '${{variables.ProdServiceConnection}}'
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo '$(subscription)'
+                      az account set --subscription '$(subscription)'
+                      az deployment group create --resource-group  $(FunctionRG)-$(env) --name '$(ProjectName)-$(env)-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/main.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/$(ParameterFileName)-$(env).json'
+          
+
+                - template: DeployFunctionApp.yml
+                  parameters:
+                      functionAppName: '$(FunctionName)-$(env)'
+                      azureServiceConnection: '$(ProdServiceConnection)'
+                      functionAppServiceFilePath: '/service/*.zip'
+                      env: '$(env)'
+                      resourceGroupName: '$(FunctionRG)-$(env)' 
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy ${{variables.ProjectName}} API Definition'
+                  inputs:
+                    azureSubscription: '${{variables.ProdServiceConnection}}'
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo '$(subscription)'
+                      az account set --subscription '$(subscription)'
+                      az deployment group create --resource-group  $(ProdApimRG) --name '$(ProjectName)-api-deploy' --template-file $(System.ArtifactsDirectory)/ops/templates/apim/main-api.bicep --parameters '$(System.ArtifactsDirectory)/ops/templates/apim/$(ApiParameterFileName)-$(env).json'
+          
